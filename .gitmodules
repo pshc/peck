@@ -1,0 +1,4 @@
+[submodule "tree-sitter-javascript"]
+	path = tree-sitter-javascript
+	url = https://github.com/pshc/tree-sitter-javascript.git
+	branch = twelve

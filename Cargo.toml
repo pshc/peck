@@ -1,0 +1,19 @@
+[package]
+name = "peck"
+version = "0.1.0"
+authors = ["Paul Collier <paul@paulcollier.ca>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+crossterm = "0.18"
+tui = { version = "0.14", default-features = false, features = ['crossterm'] }
+tree-sitter = "0.17.0"
+ropey = "1.2.0"
+better-panic = "0.2.0"
+crossbeam-channel = "0.5.0"
+log = "0.4.14"
+
+[build-dependencies]
+cc = "*"
