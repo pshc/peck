@@ -157,11 +157,23 @@ impl<T: Backend> Editor<T> {
     }
 
     pub fn handle_key_event(&mut self, event: KeyEvent) -> Result<bool, Box<dyn Error>> {
+        // first, convert the input into an EditCommand
+        let command = match self.interpret_key_event(event) {
+            Some(c) => c,
+            None => return Ok(true),
+        };
+
+        if !event.modifiers.is_empty() {
+            return Ok(true);
+        }
+
         let EditState {
             ref mut cursor,
             ref mut scroll,
-            ref text_viewport,
+            insert_mode,
+            text_viewport,
         } = self.state;
+        let right_edge = if insert_mode { 1 } else { 2 };
 
         // Q: exactly which screen size do we use below?
         // A: we should use `viewport` corresponding to whatever is still painted on the screen.
@@ -171,35 +183,30 @@ impl<T: Backend> Editor<T> {
         assert!(text_size.0 > 0 && text_size.1 > 0);
 
         let total_line_count = self.rope.len_lines().try_into()?;
+        let at_eof = cursor.1 >= total_line_count;
 
-        if !event.modifiers.is_empty() {
-            return Ok(true);
-        }
-
-        let mut cursor_moved = true;
-        match event.code {
-            KeyCode::Left => {
+        match command {
+            EditCommand::Move(ArrowKey::Left) => {
                 if cursor.0 > 0 {
                     cursor.0 -= 1;
                 } else if cursor.1 > 0 {
-                    if let Some(prev_line) = self.rope.lines_at((cursor.1 - 1).try_into()?).next() {
+                    let prev_line_idx = (cursor.1 - 1).try_into()?;
+                    if let Some(prev_line) = self.rope.lines_at(prev_line_idx).next() {
                         // move to end of previous line
                         cursor.1 -= 1;
-                        cursor.0 = prev_line.len_chars().try_into()?;
-                        if cursor.0 > 0 {
-                            cursor.0 -= 1;
-                        }
+                        let prev_length: isize = prev_line.len_chars().try_into()?;
+                        cursor.0 = 0.max(prev_length - right_edge);
                     }
                 }
             }
-            KeyCode::Right => {
-                // are we at eol?
-                let line_no = cursor.1.try_into()?;
-                if let Some(line) = self.rope.lines_at(line_no).next() {
-                    // TODO: ignore the newline at the end of `line` rather than just doing a +1?
-                    if cursor.0 + 1 >= line.len_chars().try_into()? {
-                        let at_eof = cursor.1 >= total_line_count;
+            EditCommand::Move(ArrowKey::Right) => {
+                let line_idx = cursor.1.try_into()?;
+                if let Some(line) = self.rope.lines_at(line_idx).next() {
+                    // is the cursor at the end of the line?
+                    let eol = cursor.0 + right_edge >= line.len_chars().try_into()?;
+                    if eol {
                         if !at_eof {
+                            // move to the next line
                             cursor.0 = 0;
                             cursor.1 += 1;
                         }
@@ -208,40 +215,105 @@ impl<T: Backend> Editor<T> {
                     }
                 }
             }
-            KeyCode::Up => {
+            EditCommand::Move(ArrowKey::Up) => {
                 if cursor.1 > 0 {
                     cursor.1 -= 1;
                 }
             }
-            KeyCode::Down => {
-                let at_eof = cursor.1 >= total_line_count;
+            EditCommand::Move(ArrowKey::Down) => {
                 if !at_eof {
                     cursor.1 += 1;
                 }
             }
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
-            _ => {
-                // catchall: do nothing
-                cursor_moved = false;
+            EditCommand::Quit => return Ok(false),
+            EditCommand::Newline => unimplemented!(),
+            EditCommand::Backspace => unimplemented!(),
+            EditCommand::Append(char) => {
+                assert!(self.state.insert_mode, "trying to insert in normal mode?");
+
+                println!("APPEND: {}", char); // TODO insert into rope
+            }
+            EditCommand::SetMode(mode) => {
+                let insert_mode = mode != ModeSelect::Normal;
+                let mode_changed = self.state.insert_mode != insert_mode;
+                self.state.insert_mode = insert_mode;
+
+                assert!(mode_changed, "SetMode: mode was already {:?}", insert_mode);
+
+                // press 'a' to insert after the cursor
+                // press 'i' to insert before the cursor
+                // press Esc to return to normal mode
+                match mode {
+                    ModeSelect::InsertAfterCursor => {
+                        let at_eol = match self.rope.lines_at(cursor.1.try_into()?).next() {
+                            Some(line) => cursor.0 + right_edge >= line.len_chars().try_into()?,
+                            None => true,
+                        };
+                        // if we are before EOL, then advance one as we switch into insert mode
+                        if !at_eol {
+                            cursor.0 += 1;
+                        }
+                    }
+                    ModeSelect::InsertBeforeCursor => (),
+                    ModeSelect::Normal => {
+                        // move cursor one to the left
+                        if cursor.0 > 0 {
+                            cursor.0 -= 1;
+                        }
+                    }
+                }
             }
         }
 
         // have the text buffer scroll with the cursor
-        if cursor_moved {
-            if scroll.0 > cursor.0 {
-                scroll.0 = cursor.0; // cursor pushes screen leftwards
-            } else if scroll.0 + text_size.0 <= cursor.0 {
-                scroll.0 = cursor.0 - text_size.0 + 1; // right
-            }
+        if scroll.0 > cursor.0 {
+            scroll.0 = cursor.0; // cursor pushes screen leftwards
+        } else if scroll.0 + text_size.0 <= cursor.0 {
+            scroll.0 = cursor.0 - text_size.0 + 1; // right
+        }
 
-            if scroll.1 > cursor.1 {
-                scroll.1 = cursor.1; // up
-            } else if scroll.1 + text_size.1 <= cursor.1 {
-                scroll.1 = cursor.1 - text_size.1 + 1; // down
-            }
+        if scroll.1 > cursor.1 {
+            scroll.1 = cursor.1; // up
+        } else if scroll.1 + text_size.1 <= cursor.1 {
+            scroll.1 = cursor.1 - text_size.1 + 1; // down
         }
 
         Ok(true)
+    }
+
+    pub fn interpret_key_event(&self, event: KeyEvent) -> Option<EditCommand> {
+        if !event.modifiers.is_empty() {
+            return None;
+        }
+
+        // universal movement commands
+        use EditCommand::Move;
+        match event.code {
+            KeyCode::Left => return Some(Move(ArrowKey::Left)),
+            KeyCode::Right => return Some(Move(ArrowKey::Right)),
+            KeyCode::Up => return Some(Move(ArrowKey::Up)),
+            KeyCode::Down => return Some(Move(ArrowKey::Down)),
+            _ => (),
+        }
+
+        use KeyCode::Char;
+
+        if self.state.insert_mode {
+            // most key codes will append a char here
+            match event.code {
+                Char(c) => Some(EditCommand::Append(c)),
+                KeyCode::Enter => Some(EditCommand::Newline),
+                KeyCode::Esc => Some(EditCommand::SetMode(ModeSelect::Normal)),
+                _ => None,
+            }
+        } else {
+            match event.code {
+                Char('a') => Some(EditCommand::SetMode(ModeSelect::InsertAfterCursor)),
+                Char('i') => Some(EditCommand::SetMode(ModeSelect::InsertBeforeCursor)),
+                Char('q') => Some(EditCommand::Quit),
+                _ => None,
+            }
+        }
     }
 }
 
@@ -249,10 +321,39 @@ impl<T: Backend> Editor<T> {
 pub struct EditState {
     pub cursor: (isize, isize),
     pub scroll: (isize, isize),
+    pub insert_mode: bool,
     /// This is not free state really. Rather it's `frame.size` copied from the most recent `render_layout`.
     text_viewport: Rect,
 }
 
+#[derive(Debug, Clone)]
+pub enum EditCommand {
+    SetMode(ModeSelect),
+    Append(char),
+    Move(ArrowKey),
+    Newline,
+    Backspace,
+    Quit,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModeSelect {
+    /// turns on insert_mode
+    InsertBeforeCursor,
+    /// also turns on insert_mode
+    InsertAfterCursor,
+    /// turns off insert mode
+    Normal,
+}
+
+#[derive(Debug, Clone)]
+pub enum ArrowKey {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// Returns the viewport [Rect] of the upper text window.
 pub fn render_layout<T: Backend>(
     rope: &Rope,
     terminal: &mut Terminal<T>,
@@ -274,8 +375,12 @@ pub fn render_layout<T: Backend>(
         let text_area = text_border.inner(chunks[0]);
         text_viewport = Some(text_area);
         let status = format!(
-            "({}, {}) | {}x{}",
-            cursor.0, cursor.1, text_area.width, text_area.height
+            "({}, {})─{}x{}{}",
+            cursor.0, cursor.1, text_area.width, text_area.height,
+            match state.insert_mode {
+                true => "─[INSERT]",
+                false => "",
+            }
         );
         text_border = text_border.title(status);
         frame.render_widget(text_border, chunks[0]);
@@ -304,6 +409,7 @@ pub fn render_layout<T: Backend>(
         && cursor.0 < scroll.0 + width as isize
         && cursor.1 < scroll.1 + height as isize;
 
+    // actually reposition the cursor
     if cursor_inside_window {
         let off_x = (cursor.0 - scroll.0) as u16;
         let off_y = (cursor.1 - scroll.1) as u16;
