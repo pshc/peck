@@ -12,9 +12,11 @@ use tui::{
     Terminal,
 };
 
+use text::{ArrowKey, EditCommand, ModeSelect};
 use tree_sitter::{Language, Node, Parser};
 
 mod setup;
+mod text;
 
 extern "C" {
     /** Parses Javascript. Generated C code. */
@@ -330,34 +332,6 @@ pub struct EditState {
     pub insert_mode: bool,
     /// This is not free state really. Rather it's `frame.size` copied from the most recent `render_layout`.
     text_viewport: Rect,
-}
-
-#[derive(Debug, Clone)]
-pub enum EditCommand {
-    SetMode(ModeSelect),
-    Append(char),
-    Move(ArrowKey),
-    Newline,
-    Backspace,
-    Delete,
-    Quit,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ModeSelect {
-    /// turns on insert_mode
-    InsertBeforeCursor,
-    /// also turns on insert_mode
-    InsertAfterCursor,
-    /// turns off insert mode
-    Normal,
-}
-
-#[derive(Debug, Clone)]
-pub enum ArrowKey {
-    Up,
-    Down,
-    Left,
-    Right,
 }
 
 /// Returns the viewport [Rect] of the upper text window.
