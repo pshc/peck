@@ -228,6 +228,7 @@ impl<T: Backend> Editor<T> {
             EditCommand::Quit => return Ok(false),
             EditCommand::Newline => unimplemented!(),
             EditCommand::Backspace => unimplemented!(),
+            EditCommand::Delete => unimplemented!(),
             EditCommand::Append(char) => {
                 assert!(self.state.insert_mode, "trying to insert in normal mode?");
 
@@ -309,8 +310,13 @@ impl<T: Backend> Editor<T> {
         } else {
             match event.code {
                 Char('a') => Some(EditCommand::SetMode(ModeSelect::InsertAfterCursor)),
+                Char('h') => Some(Move(ArrowKey::Left)),
                 Char('i') => Some(EditCommand::SetMode(ModeSelect::InsertBeforeCursor)),
+                Char('j') => Some(Move(ArrowKey::Down)),
+                Char('k') => Some(Move(ArrowKey::Up)),
+                Char('l') => Some(Move(ArrowKey::Right)),
                 Char('q') => Some(EditCommand::Quit),
+                Char('x') => Some(EditCommand::Delete),
                 _ => None,
             }
         }
@@ -333,6 +339,7 @@ pub enum EditCommand {
     Move(ArrowKey),
     Newline,
     Backspace,
+    Delete,
     Quit,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
