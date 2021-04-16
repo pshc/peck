@@ -38,14 +38,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     parser.set_language(language).map_err(|e| e.to_string())?;
     info!("parser.set_language(JS) OK");
 
-    let rope = Rope::from_str(
-        r#"/* 🙃 */
-function BOO_YA_KA_SHA() {
-    console.log('now we done it');
-    return 2 + 3;
-}
-"#,
-    );
+    let rope = Rope::from_str(include_str!("initial.txt"));
 
     let kin_index = index_kins(language)?;
     let ui_events = setup::setup_ui_events();
