@@ -1,6 +1,5 @@
-use crossbeam_channel::{select, Receiver};
+use crossbeam_channel::{select, Receiver, Sender};
 use crossterm::event::{Event, KeyCode, KeyEvent};
-use log::{debug, info};
 use ropey::Rope;
 use std::{borrow::Cow, collections::HashMap, convert::TryInto, error::Error, io, panic};
 use tui::{
@@ -12,16 +11,13 @@ use tui::{
     Terminal,
 };
 
+use parse::{Kin, KinIndex, ParseEvent, ParseTree, Snapshot};
 use text::{ArrowKey, EditCommand, ModeSelect};
-use tree_sitter::{Language, Node, Parser};
+use tree_sitter::Node;
 
+pub mod parse;
 mod setup;
 mod text;
-
-extern "C" {
-    /** Parses Javascript. Generated C code. */
-    fn tree_sitter_javascript() -> Language;
-}
 
 fn main() -> Result<(), Box<dyn Error>> {
     better_panic::install();
@@ -32,40 +28,49 @@ fn main() -> Result<(), Box<dyn Error>> {
     setup::setup_panic_hook();
     setup::setup_terminal()?;
 
-    // load the Javascript parser
-    let mut parser = Parser::new();
-    let language = unsafe { tree_sitter_javascript() };
-    parser.set_language(language).map_err(|e| e.to_string())?;
-    info!("parser.set_language(JS) OK");
-
     let rope = Rope::from_str(include_str!("initial.txt"));
 
-    let kin_index = index_kins(language)?;
+    let (snap_tx, tree_rx) = parse::setup_parser();
     let ui_events = setup::setup_ui_events();
+
+    // does it make sense to queue up the initial parse right away?
+    // or should we wait for the thread to be ready?
+    let rope_id = String::from("initial unhashed");
+    let first_snapshot = Snapshot { id: rope_id.clone(), text: rope.clone().into() };
+    snap_tx.send(first_snapshot)?;
 
     let state = EditState::default();
     let mut editor = Editor {
         rope,
-        parser,
+        rope_id,
+        parse_tree: None,
+        snap_tx,
+        tree_rx,
+        ui_events,
         terminal,
-        kin_index,
+        kin_index: None,
         state,
     };
-    let result = editor.main_loop(ui_events);
+    let result = editor.main_loop();
     setup::cleanup_terminal()?;
     result
 }
 
 pub struct Editor<T: Backend> {
     rope: Rope,
-    parser: Parser,
+    rope_id: String,
+    /// The latest parse tree we received from the parse thread
+    parse_tree: Option<ParseTree>,
+    snap_tx: Sender<Snapshot>,
+    tree_rx: Receiver<ParseEvent>,
+    ui_events: Receiver<Event>,
     terminal: Terminal<T>,
-    kin_index: HashMap<u16, Kin>,
+    kin_index: Option<KinIndex>,
     state: EditState,
 }
 
 impl<T: Backend> Editor<T> {
-    pub fn main_loop(&mut self, ui_events: Receiver<Event>) -> Result<(), Box<dyn Error>> {
+    pub fn main_loop(&mut self) -> Result<(), Box<dyn Error>> {
         loop {
             // FUTURE WORK: we have to change our approach if large files are loaded.
             // don't remove this assert until some suitable solution is implemented
@@ -77,46 +82,44 @@ impl<T: Backend> Editor<T> {
                 self.rope.len_bytes()
             );
 
-            // first, let's just print the text buffer, no tree
-            render_layout(&self.rope, &mut self.terminal, &self.state, None)?;
+            if let (Some(kin_index), Some(parse_tree)) = (self.kin_index.as_ref(), self.parse_tree.as_ref()) {
+                let root_node = parse_tree.tree.root_node();
+                assert_eq!(root_node.kind(), "program");
+                assert_eq!(root_node.start_position().column, 0);
 
-            // for now, convert the WHOLE rope into a heap-allocated String.
-            let source_snapshot: String = self.rope.clone().into();
-            // parse that string
-            // TODO: use the `old_tree` to speed this up
-            let tree = self
-                .parser
-                .parse(&source_snapshot, None)
-                .expect("no tree parsed at all");
-            debug!("parser.parse OK");
-
-            let root_node = tree.root_node();
-            assert_eq!(root_node.kind(), "program");
-            assert_eq!(root_node.start_position().column, 0);
-
-            // now print the tree
-            let tree_widget = TreeWidget {
-                root: root_node,
-                source_code: &source_snapshot,
-                kin_index: &self.kin_index,
+                // now print the tree
+                let tree_widget = TreeWidget {
+                    root: root_node,
+                    source_code: &parse_tree.snapshot.text,
+                    kin_index,
+                };
+                self.state.text_viewport = render_layout(
+                    &self.rope,
+                    &mut self.terminal,
+                    &self.state,
+                    Some(tree_widget),
+                )?;
+            } else {
+                // parser not loaded yet?
+                // let's just print the text buffer, no tree
+                self.state.text_viewport = render_layout(
+                    &self.rope,
+                    &mut self.terminal,
+                    &self.state,
+                    None
+                )?;
             };
-            self.state.text_viewport = render_layout(
-                &self.rope,
-                &mut self.terminal,
-                &self.state,
-                Some(tree_widget),
-            )?;
 
-            if !self.handle_events(&ui_events)? {
+            if !self.handle_events()? {
                 return Ok(());
             }
         }
     }
 
-    pub fn handle_events(&mut self, ui_events: &Receiver<Event>) -> Result<bool, Box<dyn Error>> {
+    pub fn handle_events(&mut self) -> Result<bool, Box<dyn Error>> {
         // first, block on input
         select! {
-            recv(ui_events) -> message => {
+            recv(self.ui_events) -> message => {
                 match message? {
                     Event::Key(key_event) => {
                         if !self.handle_key_event(key_event)? {
@@ -127,6 +130,19 @@ impl<T: Backend> Editor<T> {
                     Event::Resize(_w, _h) => (),
                 }
             }
+            recv(self.tree_rx) -> message => {
+                match message? {
+                    ParseEvent::LanguageIndexed(index) => {
+                        assert!(self.kin_index.is_none());
+                        self.kin_index = Some(index);
+                    }
+                    ParseEvent::TreeParsed(parse_tree) => {
+                        // should we check `parse_tree.snapshot.id` against `self.rope_id`?
+                        // these tree parses are all queued in-order so it doesn't seem necessary yet...
+                        self.parse_tree = Some(parse_tree);
+                    }
+                }
+            }
         }
 
         // now if any other events have been enqueued, process them too.
@@ -135,7 +151,7 @@ impl<T: Backend> Editor<T> {
         // we could end up spending a lot of time in here without repainting...
         loop {
             select! {
-                recv(ui_events) -> message => {
+                recv(self.ui_events) -> message => {
                     match message? {
                         Event::Key(key_event) => {
                             if !self.handle_key_event(key_event)? {
@@ -144,6 +160,14 @@ impl<T: Backend> Editor<T> {
                         }
                         Event::Mouse(_) => (),
                         Event::Resize(_w, _h) => (),
+                    }
+                }
+                recv(self.tree_rx) -> message => {
+                    match message? {
+                        ParseEvent::LanguageIndexed(_) => unreachable!(),
+                        ParseEvent::TreeParsed(parse_tree) => {
+                            self.parse_tree = Some(parse_tree);
+                        }
                     }
                 }
                 default => return Ok(true),
@@ -179,6 +203,11 @@ impl<T: Backend> Editor<T> {
 
         let total_line_count = self.rope.len_lines().try_into()?;
         let at_eof = cursor.1 >= total_line_count;
+
+        // must mark the rope dirty if you edit it
+        // TODO use a macro
+        // TODO unit test with hashing to ensure we didn't miss anything
+        let mut dirty = false;
 
         match command {
             EditCommand::Move(ArrowKey::Left) => {
@@ -227,7 +256,11 @@ impl<T: Backend> Editor<T> {
             EditCommand::Append(char) => {
                 assert!(self.state.insert_mode, "trying to insert in normal mode?");
 
-                println!("APPEND: {}", char); // TODO insert into rope
+                let char_idx = 0; // TODO
+                self.rope.insert_char(char_idx, char);
+                self.rope_id.push('+');
+                self.rope_id.push(char);
+                dirty = true;
             }
             EditCommand::SetMode(mode) => {
                 let insert_mode = mode != ModeSelect::Normal;
@@ -272,6 +305,19 @@ impl<T: Backend> Editor<T> {
             scroll.1 = cursor.1; // up
         } else if scroll.1 + text_size.1 <= cursor.1 {
             scroll.1 = cursor.1 - text_size.1 + 1; // down
+        }
+
+        // was the rope affected? notify the parser
+        if dirty {
+            // for now, convert the WHOLE rope into a heap-allocated String.
+            let text_snapshot: String = self.rope.clone().into();
+            // and send it to the parser thread
+            // (obviously the goal here is to send just the edits instead)
+            let snapshot = Snapshot {
+                id: self.rope_id.clone(),
+                text: text_snapshot,
+            };
+            self.snap_tx.send(snapshot)?;
         }
 
         Ok(true)
@@ -396,50 +442,6 @@ pub fn render_layout<T: Backend>(
     Ok(text_viewport.unwrap())
 }
 
-/// The kinds we are interested in.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub enum Kin {
-    Identifier,
-    PropertyIdentifier,
-    Comment,
-    String,
-    Brace,
-    Delimiter,
-}
-
-impl Kin {
-    pub fn from_str(str: &'static str) -> Option<Self> {
-        Some(match str {
-            "identifier" => Kin::Identifier,
-            "property_identifier" => Kin::PropertyIdentifier,
-            "comment" => Kin::Comment,
-            "string" => Kin::String,
-            "(" | ")" | "{" | "}" => Kin::Brace,
-            "." | ";" => Kin::Delimiter,
-            _ => return None,
-        })
-    }
-}
-
-/// Scans all the 16-bit node kind IDs from `lang` and maps them to [Kin]s.
-pub fn index_kins(lang: Language) -> Result<HashMap<u16, Kin>, Box<dyn Error>> {
-    let mut hash = HashMap::new();
-    // linear scan of all the node kinds
-    // ideally, we scan these at build time...
-    let count: u16 = lang.node_kind_count().try_into()?;
-    for id in 0..count {
-        if let Some(str) = lang.node_kind_for_id(id) {
-            if let Some(kin) = Kin::from_str(str) {
-                let overwritten = hash.insert(id, kin);
-                if overwritten.is_some() {
-                    return Err(format!("{:?} has two IDs", kin).into());
-                }
-            }
-        }
-    }
-    Ok(hash)
-}
-
 pub struct RopeWindowWidget<'a> {
     pub rope: &'a Rope,
     /// Number of (columns, rows) to skip
@@ -491,7 +493,7 @@ impl<'a> Widget for RopeWindowWidget<'a> {
 pub struct TreeWidget<'a> {
     pub root: Node<'a>,
     pub source_code: &'a str,
-    /// Generated by [index_kins].
+    /// Generated by [parse::index_kins].
     pub kin_index: &'a HashMap<u16, Kin>,
 }
 
