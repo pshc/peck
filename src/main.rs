@@ -237,12 +237,30 @@ impl<T: Backend> Editor<T> {
             }
             EditCommand::Move(ArrowKey::Up) => {
                 if cursor.1 > 0 {
+                    // TODO editor state should remember which column we moved vertically from
+                    // so that holding up/down keeps you aligned horizontally despite the ragged right
                     cursor.1 -= 1;
+                    // are we past the end of the line?
+                    let line_idx = cursor.1.try_into()?;
+                    if let Some(line) = self.rope.lines_at(line_idx).next() {
+                        let len: isize = line.len_chars().try_into()?;
+                        // newline counts as a char, GUH
+                        let right = (len - right_edge).max(0);
+                        cursor.0 = cursor.0.min(right);
+                    }
                 }
             }
             EditCommand::Move(ArrowKey::Down) => {
                 if !at_eof {
                     cursor.1 += 1;
+                    // DRY
+                    // are we past the end of the line?
+                    let line_idx = cursor.1.try_into()?;
+                    if let Some(line) = self.rope.lines_at(line_idx).next() {
+                        let len: isize = line.len_chars().try_into()?;
+                        let right = (len - right_edge).max(0);
+                        cursor.0 = cursor.0.min(right);
+                    }
                 }
             }
             EditCommand::Quit => return Ok(false),
