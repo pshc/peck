@@ -1,5 +1,5 @@
 use crossbeam_channel::{select, Receiver, Sender};
-use crossterm::event::{Event, KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ropey::Rope;
 use std::{borrow::Cow, collections::HashMap, convert::TryInto, error::Error, io, panic};
 use tui::{
@@ -12,7 +12,7 @@ use tui::{
 };
 
 use parse::{Kin, KinIndex, ParseEvent, ParseTree, Snapshot};
-use text::{ArrowKey, EditCommand, ModeSelect};
+use text::{EditCommand, Go, ModeSelect};
 use tree_sitter::Node;
 
 pub mod parse;
@@ -206,36 +206,22 @@ impl<T: Backend> Editor<T> {
         let mut dirty = false;
 
         match command {
-            EditCommand::Move(ArrowKey::Left) => {
+            EditCommand::Move(Go::Left) => {
                 if cursor.0 > 0 {
                     cursor.0 -= 1;
-                } else if cursor.1 > 0 {
-                    let prev_line_idx = (cursor.1 - 1).try_into()?;
-                    if let Some(prev_line) = self.rope.lines_at(prev_line_idx).next() {
-                        // move to end of previous line
-                        cursor.1 -= 1;
-                        let prev_length: isize = prev_line.len_chars().try_into()?;
-                        cursor.0 = 0.max(prev_length - right_edge);
-                    }
                 }
             }
-            EditCommand::Move(ArrowKey::Right) => {
+            EditCommand::Move(Go::Right) => {
                 let line_idx = cursor.1.try_into()?;
                 if let Some(line) = self.rope.lines_at(line_idx).next() {
                     // is the cursor at the end of the line?
                     let eol = cursor.0 + right_edge >= line.len_chars().try_into()?;
-                    if eol {
-                        if !at_eof {
-                            // move to the next line
-                            cursor.0 = 0;
-                            cursor.1 += 1;
-                        }
-                    } else {
+                    if !eol {
                         cursor.0 += 1;
                     }
                 }
             }
-            EditCommand::Move(ArrowKey::Up) => {
+            EditCommand::Move(Go::Up) => {
                 if cursor.1 > 0 {
                     // TODO editor state should remember which column we moved vertically from
                     // so that holding up/down keeps you aligned horizontally despite the ragged right
@@ -250,7 +236,7 @@ impl<T: Backend> Editor<T> {
                     }
                 }
             }
-            EditCommand::Move(ArrowKey::Down) => {
+            EditCommand::Move(Go::Down) => {
                 if !at_eof {
                     cursor.1 += 1;
                     // DRY
@@ -263,8 +249,10 @@ impl<T: Backend> Editor<T> {
                     }
                 }
             }
+            EditCommand::Move(Go::BOL) => unimplemented!(),
+            EditCommand::Move(Go::EOL) => unimplemented!(),
+            EditCommand::Move(Go::NextLine) => unimplemented!(),
             EditCommand::Quit => return Ok(false),
-            EditCommand::Newline => unimplemented!(),
             EditCommand::Backspace => unimplemented!(),
             EditCommand::Delete => unimplemented!(),
             EditCommand::Append(char) => {
@@ -281,8 +269,8 @@ impl<T: Backend> Editor<T> {
 
                 assert!(mode_changed, "SetMode: mode was already {:?}", insert_mode);
 
-                // press 'a' to insert after the cursor
-                // press 'i' to insert before the cursor
+                // press 'a' to insert after the cursor, 'A' after the line
+                // press 'i' to insert before the cursor, 'I' before the line
                 // press Esc to return to normal mode
                 match mode {
                     ModeSelect::InsertAfterCursor => {
@@ -295,7 +283,9 @@ impl<T: Backend> Editor<T> {
                             cursor.0 += 1;
                         }
                     }
+                    ModeSelect::InsertAfterLine => unimplemented!(),
                     ModeSelect::InsertBeforeCursor => (),
+                    ModeSelect::InsertBeforeLine => unimplemented!(),
                     ModeSelect::Normal => {
                         // move cursor one to the left
                         if cursor.0 > 0 {
@@ -335,17 +325,13 @@ impl<T: Backend> Editor<T> {
     }
 
     pub fn interpret_key_event(&self, event: KeyEvent) -> Option<EditCommand> {
-        if !event.modifiers.is_empty() {
-            return None;
-        }
-
         // universal movement commands
         use EditCommand::Move;
         match event.code {
-            KeyCode::Left => return Some(Move(ArrowKey::Left)),
-            KeyCode::Right => return Some(Move(ArrowKey::Right)),
-            KeyCode::Up => return Some(Move(ArrowKey::Up)),
-            KeyCode::Down => return Some(Move(ArrowKey::Down)),
+            KeyCode::Left => return Some(Move(Go::Left)),
+            KeyCode::Right => return Some(Move(Go::Right)),
+            KeyCode::Up => return Some(Move(Go::Up)),
+            KeyCode::Down => return Some(Move(Go::Down)),
             _ => (),
         }
 
@@ -355,22 +341,33 @@ impl<T: Backend> Editor<T> {
             // most key codes will append a char here
             match event.code {
                 Char(c) => Some(EditCommand::Append(c)),
-                KeyCode::Enter => Some(EditCommand::Newline),
+                KeyCode::Enter => Some(EditCommand::Append('\n')),
                 KeyCode::Esc => Some(EditCommand::SetMode(ModeSelect::Normal)),
                 _ => None,
             }
-        } else {
+        } else if event.modifiers.is_empty() {
             match event.code {
                 Char('a') => Some(EditCommand::SetMode(ModeSelect::InsertAfterCursor)),
-                Char('h') => Some(Move(ArrowKey::Left)),
+                Char('h') => Some(Move(Go::Left)),
                 Char('i') => Some(EditCommand::SetMode(ModeSelect::InsertBeforeCursor)),
-                Char('j') => Some(Move(ArrowKey::Down)),
-                Char('k') => Some(Move(ArrowKey::Up)),
-                Char('l') => Some(Move(ArrowKey::Right)),
+                Char('j') => Some(Move(Go::Down)),
+                Char('k') => Some(Move(Go::Up)),
+                Char('l') => Some(Move(Go::Right)),
                 Char('q') => Some(EditCommand::Quit),
                 Char('x') => Some(EditCommand::Delete),
+                Char('$') => Some(Move(Go::EOL)),
+                Char('^') => Some(Move(Go::BOL)),
+                KeyCode::Enter => Some(EditCommand::Move(Go::NextLine)),
                 _ => None,
             }
+        } else if event.modifiers == KeyModifiers::SHIFT {
+            match event.code {
+                Char('A') => Some(EditCommand::SetMode(ModeSelect::InsertAfterLine)),
+                Char('I') => Some(EditCommand::SetMode(ModeSelect::InsertBeforeLine)),
+                _ => None,
+            }
+        } else {
+            None
         }
     }
 }

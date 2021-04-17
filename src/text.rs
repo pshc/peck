@@ -4,8 +4,7 @@
 pub enum EditCommand {
     SetMode(ModeSelect),
     Append(char),
-    Move(ArrowKey),
-    Newline,
+    Move(Go),
     Backspace,
     Delete,
     Quit,
@@ -15,16 +14,20 @@ pub enum EditCommand {
 pub enum ModeSelect {
     /// turns on insert_mode
     InsertBeforeCursor,
-    /// also turns on insert_mode
+    InsertBeforeLine,
     InsertAfterCursor,
+    InsertAfterLine,
     /// turns off insert mode
     Normal,
 }
 
 #[derive(Debug, Clone)]
-pub enum ArrowKey {
+pub enum Go {
     Up,
     Down,
     Left,
     Right,
+    BOL,
+    EOL,
+    NextLine,
 }
