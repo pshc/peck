@@ -35,14 +35,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // does it make sense to queue up the initial parse right away?
     // or should we wait for the thread to be ready?
-    let rope_id = String::from("initial unhashed");
-    let first_snapshot = Snapshot { id: rope_id.clone(), text: rope.clone().into() };
+    let first_snapshot = Snapshot { text: rope.clone().into() };
     snap_tx.send(first_snapshot)?;
 
     let state = EditState::default();
     let mut editor = Editor {
         rope,
-        rope_id,
         parse_tree: None,
         snap_tx,
         tree_rx,
@@ -58,7 +56,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 pub struct Editor<T: Backend> {
     rope: Rope,
-    rope_id: String,
     /// The latest parse tree we received from the parse thread
     parse_tree: Option<ParseTree>,
     snap_tx: Sender<Snapshot>,
@@ -205,7 +202,6 @@ impl<T: Backend> Editor<T> {
         let at_eof = cursor.1 >= total_line_count;
 
         // must mark the rope dirty if you edit it
-        // TODO use a macro
         // TODO unit test with hashing to ensure we didn't miss anything
         let mut dirty = false;
 
@@ -258,8 +254,6 @@ impl<T: Backend> Editor<T> {
 
                 let char_idx = 0; // TODO
                 self.rope.insert_char(char_idx, char);
-                self.rope_id.push('+');
-                self.rope_id.push(char);
                 dirty = true;
             }
             EditCommand::SetMode(mode) => {
@@ -314,7 +308,6 @@ impl<T: Backend> Editor<T> {
             // and send it to the parser thread
             // (obviously the goal here is to send just the edits instead)
             let snapshot = Snapshot {
-                id: self.rope_id.clone(),
                 text: text_snapshot,
             };
             self.snap_tx.send(snapshot)?;
