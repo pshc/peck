@@ -38,16 +38,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let first_snapshot = Snapshot { text: rope.clone().into() };
     snap_tx.send(first_snapshot)?;
 
-    let state = EditState::default();
     let mut editor = Editor {
         rope,
+        viewport: Viewport::default(),
+        writer: Writer::default(),
         parse_tree: None,
         snap_tx,
         tree_rx,
         ui_events,
         terminal,
         kin_index: None,
-        state,
     };
     let result = editor.main_loop();
     setup::cleanup_terminal()?;
@@ -56,6 +56,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 pub struct Editor<T: Backend> {
     rope: Rope,
+    viewport: Viewport,
+    writer: Writer,
     /// The latest parse tree we received from the parse thread
     parse_tree: Option<ParseTree>,
     snap_tx: Sender<Snapshot>,
@@ -63,11 +65,11 @@ pub struct Editor<T: Backend> {
     ui_events: Receiver<Event>,
     terminal: Terminal<T>,
     kin_index: Option<KinIndex>,
-    state: EditState,
 }
 
 impl<T: Backend> Editor<T> {
     pub fn main_loop(&mut self) -> Result<(), Box<dyn Error>> {
+        let mut text_viewport: Rect;
         loop {
             // FUTURE WORK: we have to change our approach if large files are loaded.
             // don't remove this assert until some suitable solution is implemented
@@ -90,36 +92,38 @@ impl<T: Backend> Editor<T> {
                     source_code: &parse_tree.snapshot.text,
                     kin_index,
                 };
-                self.state.text_viewport = render_layout(
-                    &self.rope,
+                text_viewport = render_layout(
                     &mut self.terminal,
-                    &self.state,
+                    &self.rope,
+                    &self.viewport,
+                    self.writer.status(),
                     Some(tree_widget),
                 )?;
             } else {
                 // parser not loaded yet?
                 // let's just print the text buffer, no tree
-                self.state.text_viewport = render_layout(
-                    &self.rope,
+                text_viewport = render_layout(
                     &mut self.terminal,
-                    &self.state,
+                    &self.rope,
+                    &self.viewport,
+                    self.writer.status(),
                     None
                 )?;
             };
 
-            if !self.handle_events()? {
+            if !self.handle_events(text_viewport)? {
                 return Ok(());
             }
         }
     }
 
-    pub fn handle_events(&mut self) -> Result<bool, Box<dyn Error>> {
+    pub fn handle_events(&mut self, text_viewport: Rect) -> Result<bool, Box<dyn Error>> {
         // first, block on input
         select! {
             recv(self.ui_events) -> message => {
                 match message? {
                     Event::Key(key_event) => {
-                        if !self.handle_key_event(key_event)? {
+                        if !self.handle_key_event(key_event, text_viewport)? {
                             return Ok(false);
                         }
                     }
@@ -151,7 +155,7 @@ impl<T: Backend> Editor<T> {
                 recv(self.ui_events) -> message => {
                     match message? {
                         Event::Key(key_event) => {
-                            if !self.handle_key_event(key_event)? {
+                            if !self.handle_key_event(key_event, text_viewport)? {
                                 return Ok(false);
                             }
                         }
@@ -172,7 +176,7 @@ impl<T: Backend> Editor<T> {
         }
     }
 
-    pub fn handle_key_event(&mut self, event: KeyEvent) -> Result<bool, Box<dyn Error>> {
+    pub fn handle_key_event(&mut self, event: KeyEvent, tv: Rect) -> Result<bool, Box<dyn Error>> {
         // first, convert the input into an EditCommand
         let command = match self.interpret_key_event(event) {
             Some(c) => c,
@@ -183,19 +187,17 @@ impl<T: Backend> Editor<T> {
             return Ok(true);
         }
 
-        let EditState {
+        let Viewport {
             ref mut cursor,
             ref mut scroll,
-            insert_mode,
-            text_viewport,
-        } = self.state;
-        let right_edge = if insert_mode { 1 } else { 2 };
+        } = self.viewport;
+        let right_edge = if self.writer.insert_mode { 1 } else { 2 };
 
         // Q: exactly which screen size do we use below?
         // A: we should use `viewport` corresponding to whatever is still painted on the screen.
         // since we're in the middle of an event processing loop, we might run into a resize event
         // but the event should not apply until we repaint.
-        let text_size = (text_viewport.width as isize, text_viewport.height as isize);
+        let text_size = (tv.width as isize, tv.height as isize);
         assert!(text_size.0 > 0 && text_size.1 > 0);
 
         let total_line_count = self.rope.len_lines().try_into()?;
@@ -256,7 +258,7 @@ impl<T: Backend> Editor<T> {
             EditCommand::Backspace => unimplemented!(),
             EditCommand::Delete => unimplemented!(),
             EditCommand::Append(char) => {
-                assert!(self.state.insert_mode, "trying to insert in normal mode?");
+                assert!(self.writer.insert_mode, "trying to insert in normal mode?");
 
                 let char_idx = 0; // TODO
                 self.rope.insert_char(char_idx, char);
@@ -264,8 +266,8 @@ impl<T: Backend> Editor<T> {
             }
             EditCommand::SetMode(mode) => {
                 let insert_mode = mode != ModeSelect::Normal;
-                let mode_changed = self.state.insert_mode != insert_mode;
-                self.state.insert_mode = insert_mode;
+                let mode_changed = self.writer.insert_mode != insert_mode;
+                self.writer.insert_mode = insert_mode;
 
                 assert!(mode_changed, "SetMode: mode was already {:?}", insert_mode);
 
@@ -337,7 +339,7 @@ impl<T: Backend> Editor<T> {
 
         use KeyCode::Char;
 
-        if self.state.insert_mode {
+        if self.writer.insert_mode {
             // most key codes will append a char here
             match event.code {
                 Char(c) => Some(EditCommand::Append(c)),
@@ -373,23 +375,38 @@ impl<T: Backend> Editor<T> {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct EditState {
+pub struct Viewport {
     pub cursor: (isize, isize),
     pub scroll: (isize, isize),
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Writer {
     pub insert_mode: bool,
-    /// This is not free state really. Rather it's `frame.size` copied from the most recent `render_layout`.
-    text_viewport: Rect,
+}
+
+impl Writer {
+    pub fn status(&self) -> StatusLine {
+        let Writer { insert_mode } = *self;
+        StatusLine { insert_mode }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StatusLine {
+    pub insert_mode: bool,
 }
 
 /// Returns the viewport [Rect] of the upper text window.
 pub fn render_layout<T: Backend>(
-    rope: &Rope,
     terminal: &mut Terminal<T>,
-    state: &EditState,
+    rope: &Rope,
+    viewport: &Viewport,
+    status: StatusLine,
     tree_widget: Option<TreeWidget>,
 ) -> Result<Rect, Box<dyn Error>> {
     let mut text_viewport = None;
-    let EditState { cursor, scroll, .. } = *state;
+    let Viewport { cursor, scroll } = *viewport;
 
     terminal.draw(|frame| {
         let chunks = Layout::default()
@@ -405,7 +422,7 @@ pub fn render_layout<T: Backend>(
         let status = format!(
             "({}, {})─{}x{}{}",
             cursor.0, cursor.1, text_area.width, text_area.height,
-            match state.insert_mode {
+            match status.insert_mode {
                 true => "─[INSERT]",
                 false => "",
             }
