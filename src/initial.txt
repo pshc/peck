@@ -1,4 +1,4 @@
-/* 🙃 */
+/* ❤️‍🔥 */
 function BOO_YA_KA_SHA() {
     console.log('now we done it');
     return 2 + 3;

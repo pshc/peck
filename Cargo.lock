@@ -319,6 +319,8 @@ dependencies = [
  "ropey",
  "tree-sitter",
  "tui",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

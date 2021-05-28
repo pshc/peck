@@ -10,6 +10,7 @@ use tui::{
     widgets::{Block, Borders, Widget},
     Terminal,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use parse::{Kin, KinIndex, ParseEvent, ParseTree, Snapshot};
 use text::{EditCommand, Go, ModeSelect};
@@ -65,6 +66,17 @@ pub struct Editor<T: Backend> {
     ui_events: Receiver<Event>,
     terminal: Terminal<T>,
     kin_index: Option<KinIndex>,
+}
+
+/// Caches the offsets of each grapheme cluster in a given line.
+#[derive(Debug, Clone)]
+pub struct LineShape<'a> {
+    // pretty sure i'm not going to be able to borrow against the rope here... guh
+    line: Cow<'a, str>,
+    /// Lists the char index of each (visible?) grapheme
+    grapheme_offsets: Vec<usize>,
+    /// Lists the terminal column of each grapheme????
+    columns: Vec<usize>,
 }
 
 impl<T: Backend> Editor<T> {
@@ -209,20 +221,41 @@ impl<T: Backend> Editor<T> {
         let mut dirty = false;
 
         match command {
-            EditCommand::Move(Go::Left) => {
-                if cursor.0 > 0 {
+            EditCommand::Move(Go::Left) if cursor.0 > 0 => {
+                let line_idx = cursor.1.try_into()?;
+                if let Some(line) = self.rope.lines_at(line_idx).next() {
+                    // doesn't allocate if the line is within a rope chunk (happy path)
+                    // ideally we would traverse rope chunks without allocations...?
+                    // in the unhappy path this copies the rest of the line! pathological, dude!!!
+                    let str: Cow<str> = line.into();
+                    let byte_indices: Vec<usize> = str.grapheme_indices(true).map(|(offset, _cluster)| offset).collect();
+
+                    // gah these methods don't iterate backward!
+                    // we need a lookup array or something.
                     cursor.0 -= 1;
                     *char_offset -= 1;
                 }
             }
+            EditCommand::Move(Go::Left) => (), // already at left edge
             EditCommand::Move(Go::Right) => {
                 let line_idx = cursor.1.try_into()?;
                 if let Some(line) = self.rope.lines_at(line_idx).next() {
                     // is the cursor at the end of the line?
                     let eol = cursor.0 + right_edge >= line.len_chars().try_into()?;
                     if !eol {
-                        cursor.0 += 1;
-                        *char_offset += 1;
+                        // find the next grapheme cluster
+                        let col: usize = cursor.0.try_into()?;
+                        let str: Cow<str> = line.slice(col..).into();
+                        // I wonder if we could use GraphemeCursor here instead?
+                        // (however I believe it operates on byte offsets.)
+                        if let Some(grapheme) = str.graphemes(true).next() {
+                            let n_chars: usize = grapheme.chars().count();
+                            let x: isize = n_chars.try_into()?;
+                            cursor.0 += x;
+                            *char_offset += n_chars;
+                        } else {
+                            panic!("couldn't find next grapheme cluster in {:?}", str);
+                        }
                     }
                 }
             }
@@ -505,12 +538,14 @@ impl<'a> Widget for RopeWindowWidget<'a> {
             if line_y < 0 {
                 continue; // O(n) line skipping, guh
             }
+            // O(log n) here, should iterate lines instead...
             let mut line = self.rope.line(line_y as usize);
             let mut line_len = line.len_chars(); // look out for characters with weird widths...?
             let mut x = 0u16;
             if scroll.0 > 0 {
                 // chop the left side of the line off if need be
                 let clip_left = line_len.min(scroll.0 as usize);
+                // TODO this slices by char. ought to slice by terminal-character-width-grapheme-thingy
                 line = line.slice(clip_left..);
                 line_len -= clip_left;
             } else if scroll.0 < 0 {
@@ -525,6 +560,7 @@ impl<'a> Widget for RopeWindowWidget<'a> {
             line_len = line_len.min((area.width - x).try_into().unwrap());
 
             if line_len > 0 {
+                // POSSIBLE ALLOCATION HERE TOO
                 let cow: Cow<str> = line.into();
                 let (_x, _y) = buf.set_stringn(x + area.x, y + area.y, cow, line_len, style);
             }
