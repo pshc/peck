@@ -188,6 +188,7 @@ impl<T: Backend> Editor<T> {
         }
 
         let Viewport {
+            ref mut char_offset,
             ref mut cursor,
             ref mut scroll,
         } = self.viewport;
@@ -211,6 +212,7 @@ impl<T: Backend> Editor<T> {
             EditCommand::Move(Go::Left) => {
                 if cursor.0 > 0 {
                     cursor.0 -= 1;
+                    *char_offset -= 1;
                 }
             }
             EditCommand::Move(Go::Right) => {
@@ -220,34 +222,47 @@ impl<T: Backend> Editor<T> {
                     let eol = cursor.0 + right_edge >= line.len_chars().try_into()?;
                     if !eol {
                         cursor.0 += 1;
+                        *char_offset += 1;
                     }
                 }
             }
             EditCommand::Move(Go::Up) => {
                 if cursor.1 > 0 {
+                    debug_assert_eq!(cursor.1 as usize, self.rope.char_to_line(*char_offset));
                     // TODO editor state should remember which column we moved vertically from
                     // so that holding up/down keeps you aligned horizontally despite the ragged right
-                    cursor.1 -= 1;
                     // are we past the end of the line?
-                    let line_idx = cursor.1.try_into()?;
+                    let line_idx = (cursor.1 - 1).try_into()?;
                     if let Some(line) = self.rope.lines_at(line_idx).next() {
                         let len: isize = line.len_chars().try_into()?;
                         // newline counts as a char, GUH
                         let right = (len - right_edge).max(0);
                         cursor.0 = cursor.0.min(right);
+                        cursor.1 -= 1;
+                        // okay, we've moved the cursor up; compute the new char offset
+                        let line_offset = self.rope.line_to_char(line_idx);
+                        *char_offset = line_offset + (cursor.0 as usize);
+                        // basic check
+                        debug_assert_eq!(cursor.1 as usize, self.rope.char_to_line(*char_offset));
                     }
                 }
             }
             EditCommand::Move(Go::Down) => {
                 if !at_eof {
-                    cursor.1 += 1;
+                    debug_assert_eq!(cursor.1, self.rope.char_to_line(*char_offset) as isize);
                     // DRY
                     // are we past the end of the line?
-                    let line_idx = cursor.1.try_into()?;
+                    let line_idx = (cursor.1 + 1).try_into()?;
                     if let Some(line) = self.rope.lines_at(line_idx).next() {
                         let len: isize = line.len_chars().try_into()?;
                         let right = (len - right_edge).max(0);
                         cursor.0 = cursor.0.min(right);
+                        cursor.1 += 1;
+                        // compute the new char offset
+                        let line_offset = self.rope.line_to_char(line_idx);
+                        *char_offset = line_offset + (cursor.0 as usize);
+                        // basic check
+                        debug_assert_eq!(cursor.1, self.rope.char_to_line(*char_offset) as isize);
                     }
                 }
             }
@@ -259,9 +274,9 @@ impl<T: Backend> Editor<T> {
             EditCommand::Delete => unimplemented!(),
             EditCommand::Append(char) => {
                 assert!(self.writer.insert_mode, "trying to insert in normal mode?");
-
-                let char_idx = 0; // TODO
-                self.rope.insert_char(char_idx, char);
+                self.rope.insert_char(*char_offset, char);
+                cursor.0 += 1;
+                *char_offset += 1;
                 dirty = true;
             }
             EditCommand::SetMode(mode) => {
@@ -283,6 +298,7 @@ impl<T: Backend> Editor<T> {
                         // if we are before EOL, then advance one as we switch into insert mode
                         if !at_eol {
                             cursor.0 += 1;
+                            *char_offset += 1;
                         }
                     }
                     ModeSelect::InsertAfterLine => unimplemented!(),
@@ -292,6 +308,7 @@ impl<T: Backend> Editor<T> {
                         // move cursor one to the left
                         if cursor.0 > 0 {
                             cursor.0 -= 1;
+                            *char_offset -= 1;
                         }
                     }
                 }
@@ -378,6 +395,7 @@ impl<T: Backend> Editor<T> {
 pub struct Viewport {
     pub cursor: (isize, isize),
     pub scroll: (isize, isize),
+    pub char_offset: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -406,7 +424,7 @@ pub fn render_layout<T: Backend>(
     tree_widget: Option<TreeWidget>,
 ) -> Result<Rect, Box<dyn Error>> {
     let mut text_viewport = None;
-    let Viewport { cursor, scroll } = *viewport;
+    let Viewport { cursor, scroll, .. } = *viewport;
 
     terminal.draw(|frame| {
         let chunks = Layout::default()
