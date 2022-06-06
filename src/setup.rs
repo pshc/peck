@@ -4,7 +4,7 @@ use crossbeam_channel::{unbounded, Receiver};
 use crossterm::{cursor, event::Event, execute, terminal};
 use std::{
     error::Error,
-    io::{self, Write},
+    io,
     panic, thread,
 };
 
